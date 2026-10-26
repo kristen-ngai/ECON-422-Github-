@@ -1,0 +1,560 @@
+# Figures
+
+from pathlib import Path
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_PATH = PROJECT_DIR / "data" / "processed" / "monthly_macro.csv"
+OUTPUT_DIR = PROJECT_DIR / "results" / "figures"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DATE_COL = "observation_date"
+FARE_COL = "airline_cpi"
+FUEL_COL = "jet_fuel"
+
+# Predict the change in airline CPI over the next h months.
+# This is a forecasting exercise, not a causal estimate.
+HORIZONS = [1, 3, 6]
+N_SPLITS = 5
+HIGH_VOLATILITY_QUANTILE = 0.75
+
+# ============================================================
+# 2. LOAD AND PREPARE DATA
+# ============================================================
+
+df = pd.read_csv(DATA_PATH)
+
+# Normalize common FRED column-name variations.
+rename_map = {
+    "DATE": "observation_date",
+    "date": "observation_date",
+    "CUSR0000SETG01": "airline_cpi",
+    "MJFUELUSGULF": "jet_fuel",
+    "UNRATE": "unemployment",
+    "CPILFESL": "core_cpi",
+}
+df = df.rename(columns={
+    old: new for old, new in rename_map.items()
+    if old in df.columns and new not in df.columns
+})
+
+if DATE_COL not in df.columns:
+    raise ValueError(
+        f"Date column '{DATE_COL}' not found. "
+        f"Available columns: {df.columns.tolist()}"
+    )
+
+if FARE_COL not in df.columns:
+    raise ValueError(
+        f"Fare/CPI column '{FARE_COL}' not found. "
+        f"Available columns: {df.columns.tolist()}"
+    )
+
+df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+df = (
+    df.sort_values(DATE_COL)
+      .drop_duplicates(DATE_COL)
+      .set_index(DATE_COL)
+)
+
+for col in df.columns:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+df = df.asfreq("MS")
+
+# CPI level and year-over-year inflation.
+df["fare_yoy"] = df[FARE_COL].pct_change(12) * 100
+df["fare_mom"] = df[FARE_COL].pct_change() * 100
+
+# A baseline forecast can use only past fare information.
+for lag in [1, 2, 3, 6, 12]:
+    df[f"fare_yoy_lag{lag}"] = df["fare_yoy"].shift(lag)
+    df[f"fare_mom_lag{lag}"] = df["fare_mom"].shift(lag)
+
+# Fuel features are lagged to reduce look-ahead leakage.
+# Confirm the publication/release date before treating a month
+# as information that was available at the forecast origin.
+if FUEL_COL in df.columns:
+    df["fuel_change_1m"] = df[FUEL_COL].pct_change() * 100
+    df["fuel_change_3m"] = df[FUEL_COL].pct_change(3) * 100
+    df["fuel_change_12m"] = df[FUEL_COL].pct_change(12) * 100
+
+    for col in [
+        FUEL_COL, "fuel_change_1m",
+        "fuel_change_3m", "fuel_change_12m"
+    ]:
+        df[f"{col}_lag1"] = df[col].shift(1)
+else:
+    print(
+        f"WARNING: '{FUEL_COL}' not found. "
+        "Fuel models will not be available."
+    )
+
+# Calendar features are known in advance.
+df["month_sin"] = np.sin(2 * np.pi * df.index.month / 12)
+df["month_cos"] = np.cos(2 * np.pi * df.index.month / 12)
+
+fare_features = [
+    "fare_yoy_lag1", "fare_yoy_lag2", "fare_yoy_lag3",
+    "fare_yoy_lag6", "fare_yoy_lag12",
+    "fare_mom_lag1", "fare_mom_lag2",
+    "fare_mom_lag3", "fare_mom_lag6",
+    "fare_mom_lag12",
+    "month_sin", "month_cos",
+]
+
+fuel_features = [
+    f"{FUEL_COL}_lag1",
+    "fuel_change_1m_lag1",
+    "fuel_change_3m_lag1",
+    "fuel_change_12m_lag1",
+]
+
+fuel_features = [
+    c for c in fuel_features if c in df.columns
+]
+
+if not fuel_features:
+    print("WARNING: No fuel features found.")
+
+# ============================================================
+# 3. DEFINE MODELS
+# ============================================================
+
+def build_models():
+    models = {
+        "Naive": None,
+        "Linear Regression": make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            LinearRegression()
+        ),
+        "Random Forest": make_pipeline(
+            SimpleImputer(strategy="median"),
+            RandomForestRegressor(
+                n_estimators=300,
+                min_samples_leaf=3,
+                max_features=1.0,
+                random_state=42,
+                n_jobs=-1
+            )
+        ),
+    }
+
+    if fuel_features:
+        models["Random Forest + Fuel"] = make_pipeline(
+            SimpleImputer(strategy="median"),
+            RandomForestRegressor(
+                n_estimators=300,
+                min_samples_leaf=3,
+                max_features=1.0,
+                random_state=42,
+                n_jobs=-1
+            )
+        )
+
+        models["XGBoost + Fuel"] = make_pipeline(
+            SimpleImputer(strategy="median"),
+            HistGradientBoostingRegressor(
+                max_iter=200,
+                learning_rate=0.05,
+                max_leaf_nodes=15,
+                l2_regularization=1.0,
+                random_state=42
+            )
+        )
+
+    return models
+
+
+# ============================================================
+# 4. EXPANDING-WINDOW BACKTEST
+# ============================================================
+
+# At origin t, predict the change from fare CPI at t to t+h.
+# All predictors must be observable at origin t.
+# Training rows are restricted so their outcomes were already
+# observed by the forecast origin.
+def run_backtest():
+    all_results = []
+
+    for horizon in HORIZONS:
+        work = df.copy()
+
+        work["target"] = (
+            work[FARE_COL].shift(-horizon)
+            / work[FARE_COL] - 1
+        ) * 100
+
+        # Build predictor sets separately.
+        feature_sets = {
+            "Linear Regression": fare_features,
+            "Random Forest": fare_features,
+            "Random Forest + Fuel": fare_features + fuel_features,
+            "XGBoost + Fuel": fare_features + fuel_features,
+        }
+
+        # Target is the percentage change over the horizon.
+        # Naive forecast: zero change from current CPI.
+        usable = work.dropna(subset=["target"]).copy()
+        usable = usable.iloc[12:]  # allow enough lag history
+
+        if len(usable) < N_SPLITS + 8:
+            print(f"Skipping {horizon}-month horizon: too little data.")
+            continue
+
+        splitter = TimeSeriesSplit(n_splits=N_SPLITS)
+
+        for fold, (train_idx, test_idx) in enumerate(
+            splitter.split(usable), start=1
+        ):
+            train = usable.iloc[train_idx]
+            test = usable.iloc[test_idx]
+
+            # Do not train on outcomes that would not yet have
+            # been observed at the beginning of the test block.
+            origin_date = test.index[0]
+            train = train.loc[
+                train.index + pd.DateOffset(months=horizon)
+                <= origin_date
+            ]
+
+            if len(train) < 10:
+                continue
+
+            y_train = train["target"]
+            y_test = test["target"]
+
+            # Naive model predicts zero cumulative CPI change.
+            naive_pred = np.zeros(len(test))
+
+            all_results.append(pd.DataFrame({
+                "date": test.index,
+                "horizon": horizon,
+                "model": "Naive",
+                "actual": y_test.to_numpy(),
+                "predicted": naive_pred,
+                "fold": fold,
+            }))
+
+            for model_name, features in feature_sets.items():
+                if model_name not in build_models():
+                    continue
+
+                # Avoid silently using missing columns.
+                features = [c for c in features if c in work.columns]
+                if not features:
+                    continue
+
+                model = clone(build_models()[model_name])
+                model.fit(train[features], y_train)
+                pred = model.predict(test[features])
+
+                all_results.append(pd.DataFrame({
+                    "date": test.index,
+                    "horizon": horizon,
+                    "model": model_name,
+                    "actual": y_test.to_numpy(),
+                    "predicted": pred,
+                    "fold": fold,
+                }))
+
+    if not all_results:
+        raise ValueError(
+            "No backtest results were produced. Check your date range, "
+            "column names, and number of observations."
+        )
+
+    return pd.concat(all_results, ignore_index=True)
+
+
+predictions = run_backtest()
+predictions.to_csv(OUTPUT_DIR.parent / "backtest_predictions.csv", index=False)
+
+# ============================================================
+# 5. METRICS: MAE AND RMSE
+# ============================================================
+
+def metric_table(results, group_cols):
+    records = []
+    for keys, group in results.groupby(group_cols):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        error = group["actual"] - group["predicted"]
+        row = dict(zip(group_cols, keys))
+        row["MAE"] = mean_absolute_error(
+            group["actual"], group["predicted"]
+        )
+        row["RMSE"] = np.sqrt(mean_squared_error(
+            group["actual"], group["predicted"]
+        ))
+        row["N"] = len(group)
+        records.append(row)
+
+    return pd.DataFrame(records)
+
+
+metrics = metric_table(predictions, ["horizon", "model"])
+metrics.to_csv(OUTPUT_DIR.parent / "model_metrics.csv", index=False)
+print("\nMODEL PERFORMANCE")
+print(metrics.sort_values(["horizon", "MAE"]).round(3).to_string(index=False))
+
+# Figure 1: MAE and RMSE by horizon.
+fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+
+for ax, metric in zip(axes, ["MAE", "RMSE"]):
+    pivot = metrics.pivot(
+        index="model", columns="horizon", values=metric
+    )
+    pivot.plot(kind="bar", ax=ax)
+    ax.set_title(f"{metric} by Forecast Horizon")
+    ax.set_xlabel("")
+    ax.set_ylabel("Error (percentage points)")
+    ax.legend(title="Horizon (months)")
+    ax.tick_params(axis="x", rotation=35)
+    ax.grid(axis="y", alpha=0.25)
+
+fig.suptitle("Airline CPI Forecasting Performance", fontsize=15)
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "01_model_performance.png", dpi=300,
+            bbox_inches="tight")
+plt.close(fig)
+
+# Figure 2: Error distribution across all test predictions.
+fig, ax = plt.subplots(figsize=(11, 6))
+predictions["error"] = predictions["actual"] - predictions["predicted"]
+predictions.boxplot(column="error", by=["horizon", "model"], ax=ax,
+                    rot=45, grid=False)
+ax.set_title("Out-of-Sample Forecast Error Distribution")
+ax.set_xlabel("Horizon and model")
+ax.set_ylabel("Actual − predicted (percentage points)")
+fig.suptitle("")
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "02_error_distribution.png", dpi=300,
+            bbox_inches="tight")
+plt.close(fig)
+
+# ============================================================
+# 6. VALUE ADDED BY FUEL FEATURES
+# ============================================================
+
+fuel_pairs = [
+    ("Random Forest", "Random Forest + Fuel"),
+    # Linear regression has no fuel version in the requested
+    # five-model comparison; add one if you want this comparison.
+]
+
+fuel_gain = []
+for horizon in HORIZONS:
+    for base_name, fuel_name in fuel_pairs:
+        sub = metrics[metrics["horizon"] == horizon].set_index("model")
+        if base_name in sub.index and fuel_name in sub.index:
+            base_mae = sub.loc[base_name, "MAE"]
+            fuel_mae = sub.loc[fuel_name, "MAE"]
+            gain = (base_mae - fuel_mae) / base_mae * 100
+            fuel_gain.append({
+                "horizon": horizon,
+                "comparison": f"{base_name} vs {fuel_name}",
+                "baseline_MAE": base_mae,
+                "fuel_MAE": fuel_mae,
+                "MAE_improvement_pct": gain,
+            })
+
+fuel_gain = pd.DataFrame(fuel_gain)
+fuel_gain.to_csv(OUTPUT_DIR.parent / "fuel_feature_improvement.csv",
+                 index=False)
+
+if not fuel_gain.empty:
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(
+        fuel_gain["horizon"].astype(str) + " months",
+        fuel_gain["MAE_improvement_pct"]
+    )
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_title("Forecast MAE Improvement from Adding Fuel Prices")
+    ax.set_xlabel("Forecast horizon")
+    ax.set_ylabel("MAE improvement (%)")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(OUTPUT_DIR / "03_fuel_value_added.png", dpi=300,
+                bbox_inches="tight")
+    plt.close(fig)
+
+# ============================================================
+# 7. HIGH-VOLATILITY VS NORMAL PERIODS
+# ============================================================
+
+# Define volatility using trailing 12-month standard deviation
+# of monthly airline CPI inflation, without looking forward.
+vol = df["fare_mom"].rolling(12).std()
+cutoff = vol.quantile(HIGH_VOLATILITY_QUANTILE)
+
+volatility_label = pd.Series(index=df.index, dtype="object")
+volatility_label.loc[vol <= cutoff] = "Normal volatility"
+volatility_label.loc[vol > cutoff] = "High volatility"
+
+predictions["volatility"] = predictions["date"].map(volatility_label)
+vol_results = predictions.dropna(subset=["volatility"])
+
+vol_metrics = metric_table(
+    vol_results, ["horizon", "model", "volatility"]
+)
+vol_metrics.to_csv(OUTPUT_DIR.parent / "volatility_metrics.csv", index=False)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+for ax, metric in zip(axes, ["MAE", "RMSE"]):
+    subset = vol_metrics[vol_metrics["horizon"] == 1]
+    pivot = subset.pivot(index="model", columns="volatility", values=metric)
+    pivot.plot(kind="bar", ax=ax)
+    ax.set_title(f"{metric}: 1-Month Forecast")
+    ax.set_xlabel("")
+    ax.set_ylabel("Error (percentage points)")
+    ax.tick_params(axis="x", rotation=35)
+    ax.grid(axis="y", alpha=0.25)
+
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "04_volatility_performance.png", dpi=300,
+            bbox_inches="tight")
+plt.close(fig)
+
+# ============================================================
+# 8. OPTIONAL SHAP FIGURES
+# ============================================================
+
+# For valid SHAP plots, explain a model trained on the training
+# portion only, then explain held-out observations. This section
+# uses the most recent 20% as a holdout for illustration.
+try:
+    import shap
+
+    if fuel_features:
+        features = fare_features + fuel_features
+        shap_data = df.dropna(subset=features + ["fare_yoy"]).copy()
+
+        split = int(len(shap_data) * 0.8)
+        train = shap_data.iloc[:split]
+        test = shap_data.iloc[split:]
+
+        if len(train) >= 30 and len(test) >= 5:
+            model = RandomForestRegressor(
+                n_estimators=300,
+                min_samples_leaf=3,
+                random_state=42,
+                n_jobs=-1
+            )
+            model.fit(train[features], train["fare_yoy"])
+
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(test[features])
+
+            plt.figure()
+            shap.summary_plot(
+                shap_values, test[features],
+                show=False, max_display=15
+            )
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "05_shap_summary.png",
+                        dpi=300, bbox_inches="tight")
+            plt.close("all")
+
+            fuel_col = f"{FUEL_COL}_lag1"
+            if fuel_col in features:
+                shap.dependence_plot(
+                    fuel_col, shap_values, test[features],
+                    show=False
+                )
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / "06_shap_fuel_dependence.png",
+                            dpi=300, bbox_inches="tight")
+                plt.close("all")
+        else:
+            print("Not enough observations for SHAP holdout plots.")
+    else:
+        print("SHAP plots skipped: fuel features unavailable.")
+
+except ImportError:
+    print("SHAP not installed; install with pip install shap.")
+
+# ============================================================
+# 9. OPTIONAL ROUTE-LEVEL PRODUCT METRICS
+# ============================================================
+
+# If you have held-out route predictions, create:
+# data/processed/route_holdout_predictions.csv
+# with columns:
+# actual_fare, predicted_fare, origin, destination,
+# carrier, prediction_status
+#
+# prediction_status can be "supported" or "insufficient_data".
+route_path = PROJECT_DIR / "data" / "processed" / "route_holdout_predictions.csv"
+
+if route_path.exists():
+    route = pd.read_csv(route_path)
+
+    if {"actual_fare", "predicted_fare"}.issubset(route.columns):
+        valid = route.dropna(subset=["actual_fare", "predicted_fare"]).copy()
+        valid["error"] = valid["actual_fare"] - valid["predicted_fare"]
+
+        route_metrics = pd.DataFrame([{
+            "heldout_rows": len(valid),
+            "MAE_dollars": mean_absolute_error(
+                valid["actual_fare"], valid["predicted_fare"]
+            ),
+            "RMSE_dollars": np.sqrt(mean_squared_error(
+                valid["actual_fare"], valid["predicted_fare"]
+            )),
+            "mean_error_dollars": valid["error"].mean(),
+            "route_count": (
+                valid[["origin", "destination"]]
+                .drop_duplicates().shape[0]
+                if {"origin", "destination"}.issubset(valid.columns)
+                else np.nan
+            ),
+        }])
+
+        if "prediction_status" in route.columns:
+            route_metrics["supported_request_pct"] = (
+                route["prediction_status"].eq("supported").mean() * 100
+            )
+
+        route_metrics.to_csv(
+            OUTPUT_DIR.parent / "route_product_metrics.csv", index=False
+        )
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+        ax.scatter(valid["actual_fare"], valid["predicted_fare"], alpha=0.5)
+        lo = min(valid["actual_fare"].min(), valid["predicted_fare"].min())
+        hi = max(valid["actual_fare"].max(), valid["predicted_fare"].max())
+        ax.plot([lo, hi], [lo, hi], linestyle="--")
+        ax.set_xlabel("Observed held-out fare ($)")
+        ax.set_ylabel("Predicted fare ($)")
+        ax.set_title("Route Fare Predictions vs Observed Fares")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "07_route_fare_accuracy.png",
+                    dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+print(f"\nFigures saved to: {OUTPUT_DIR}")
+print(f"Metrics saved to: {OUTPUT_DIR.parent}")
+

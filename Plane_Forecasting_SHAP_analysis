@@ -1,0 +1,200 @@
+import os
+import requests
+import pandas as pd
+
+FRED_API_KEY = os.environ["FRED_API_KEY"]
+
+SERIES = {
+    "airline_cpi": "CUSR0000SETG01",
+    "jet_fuel": "MJFUELUSGULF",
+    "unemployment": "UNRATE",
+    "core_cpi": "CPILFESL",
+}
+
+def fetch_fred_series(series_id):
+    url = "https://api.stlouisfed.org/fred/series/observations"
+
+    response = requests.get(
+        url,
+        params={
+            "series_id": series_id,
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "observation_start": "2000-01-01",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    df = pd.DataFrame(response.json()["observations"])
+    df["date"] = pd.to_datetime(df["date"])
+    df["value"] = pd.to_numeric(
+        df["value"], errors="coerce"
+    )
+
+    return df.set_index("date")["value"]
+
+series = {
+    name: fetch_fred_series(series_id)
+    for name, series_id in SERIES.items()
+}
+
+# Convert every series to a monthly frequency.
+monthly = pd.concat(
+    [
+        values.resample("MS").mean().rename(name)
+        for name, values in series.items()
+    ],
+    axis=1,
+)
+
+monthly = monthly.sort_index()
+
+from pathlib import Path
+
+Path("data/processed").mkdir(parents=True, exist_ok=True)
+monthly.to_csv("data/processed/monthly_macro.csv")
+print(monthly.tail())
+
+#Step 2
+import numpy as np
+import pandas as pd
+
+df = pd.read_csv(
+    "data/processed/monthly_macro.csv",
+    parse_dates=["date"],
+    index_col="date",
+).sort_index()
+
+# Inflation targets.
+df["fare_inflation_yoy"] = (
+    df["airline_cpi"].pct_change(12) * 100
+)
+
+df["fare_inflation_mom"] = (
+    df["airline_cpi"].pct_change() * 100
+)
+
+df["fuel_change_mom"] = (
+    df["jet_fuel"].pct_change() * 100
+)
+
+df["fuel_change_yoy"] = (
+    df["jet_fuel"].pct_change(12) * 100
+)
+
+# Past information only.
+for lag in [1, 2, 3, 6, 12]:
+    df[f"fare_lag_{lag}"] = (
+        df["fare_inflation_yoy"].shift(lag)
+    )
+
+for lag in [1, 3, 6]:
+    df[f"fuel_lag_{lag}"] = (
+        df["fuel_change_mom"].shift(lag)
+    )
+
+df["month"] = df.index.month
+
+df = df.replace([np.inf, -np.inf], np.nan)
+df = df.dropna()
+
+df.to_csv("data/processed/forecast_features.csv")
+
+#Step 3:
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import clone
+import pandas as pd
+
+df = pd.read_csv(
+    "data/processed/forecast_features.csv",
+    index_col="date",
+    parse_dates=True,
+).sort_index()
+
+target = "fare_inflation_yoy"
+
+fare_features = [
+    "fare_lag_1", "fare_lag_2", "fare_lag_3",
+    "fare_lag_6", "fare_lag_12", "month",
+]
+
+fuel_features = [
+    "fuel_lag_1", "fuel_lag_3", "fuel_lag_6",
+]
+
+# Target must be known at the prediction origin.
+df["target_next_month"] = df[target].shift(-1)
+df = df.dropna()
+
+models = {
+    "fare_only": (
+        fare_features,
+        RandomForestRegressor(
+            n_estimators=300,
+            min_samples_leaf=3,
+            random_state=42,
+        ),
+    ),
+    "fare_plus_fuel": (
+        fare_features + fuel_features,
+        RandomForestRegressor(
+            n_estimators=300,
+            min_samples_leaf=3,
+            random_state=42,
+        ),
+    ),
+}
+
+splitter = TimeSeriesSplit(n_splits=5, test_size=12)
+results = []
+
+for fold, (train_idx, test_idx) in enumerate(
+    splitter.split(df), start=1
+):
+    train = df.iloc[train_idx]
+    test = df.iloc[test_idx]
+
+    for name, (features, model) in models.items():
+        fitted = clone(model)
+        fitted.fit(train[features], train["target_next_month"])
+        pred = fitted.predict(test[features])
+
+        results.append({
+            "fold": fold,
+            "model": name,
+            "mae": mean_absolute_error(
+                test["target_next_month"], pred
+            ),
+            "rmse": root_mean_squared_error(
+                test["target_next_month"], pred
+            ),
+        })
+
+results_df = pd.DataFrame(results)
+print(results_df.groupby("model")[["mae", "rmse"]].mean())
+
+#Step 4
+import shap
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+
+features = fare_features + fuel_features
+
+model = RandomForestRegressor(
+    n_estimators=300,
+    min_samples_leaf=3,
+    random_state=42,
+)
+
+model.fit(train[features], train["target_next_month"])
+
+explainer = shap.TreeExplainer(model)
+shap_values = explainer(test[features])
+
+shap.plots.beeswarm(shap_values, show=False)
+plt.tight_layout()
+plt.savefig("shap_summary.png", dpi=200)
+plt.show()

@@ -1,0 +1,745 @@
+
+from pathlib import Path
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data" / "processed"
+RESULTS_DIR = PROJECT_DIR / "results"
+FIGURES_DIR = RESULTS_DIR / "figures"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_PATH = DATA_DIR / "monthly_macro.csv"
+
+FARE_COL = "airline_cpi"
+FUEL_COL = "jet_fuel"
+HORIZONS = [1, 3, 6]
+N_SPLITS = 5
+RANDOM_STATE = 42
+
+# ============================================================
+# 2. DOWNLOAD FRED DATA IF NEEDED
+# ============================================================
+
+def download_fred_data():
+    import requests
+
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "monthly_macro.csv was not found and FRED_API_KEY is not set. "
+            "Set your FRED API key or place monthly_macro.csv in "
+            "data/processed/."
+        )
+
+    series_ids = {
+        "airline_cpi": "CUSR0000SETG01",
+        "jet_fuel": "MJFUELUSGULF",
+        "unemployment": "UNRATE",
+        "core_cpi": "CPILFESL",
+    }
+
+    series = {}
+    for name, series_id in series_ids.items():
+        response = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "observation_start": "2000-01-01",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        observations = pd.DataFrame(response.json()["observations"])
+        observations["date"] = pd.to_datetime(observations["date"])
+        observations["value"] = pd.to_numeric(
+            observations["value"], errors="coerce"
+        )
+        series[name] = observations.set_index("date")["value"]
+
+    monthly = pd.concat(
+        [
+            values.resample("MS").mean().rename(name)
+            for name, values in series.items()
+        ],
+        axis=1,
+    ).sort_index()
+
+    monthly.index.name = "date"
+    monthly.to_csv(DATA_PATH)
+    print(f"Downloaded FRED data to {DATA_PATH}")
+
+
+def load_macro_data():
+    if not DATA_PATH.exists():
+        download_fred_data()
+
+    data = pd.read_csv(DATA_PATH)
+
+    # Support both "date" and FRED's "observation_date".
+    date_candidates = ["date", "observation_date", "DATE"]
+    date_col = next((c for c in date_candidates if c in data.columns), None)
+
+    if date_col is None:
+        # Some CSVs store the date as the first unnamed/index column.
+        first_col = data.columns[0]
+        if first_col.startswith("Unnamed"):
+            date_col = first_col
+        else:
+            raise ValueError(
+                "Could not identify the date column. Expected 'date' "
+                "or 'observation_date'."
+            )
+
+    data = data.rename(columns={date_col: "date"})
+    data["date"] = pd.to_datetime(data["date"])
+
+    # Normalize common FRED series IDs if present.
+    data = data.rename(columns={
+        "CUSR0000SETG01": "airline_cpi",
+        "MJFUELUSGULF": "jet_fuel",
+        "UNRATE": "unemployment",
+        "CPILFESL": "core_cpi",
+    })
+
+    required = [FARE_COL, FUEL_COL]
+    missing = [c for c in required if c not in data.columns]
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {missing}. "
+            f"Available columns: {data.columns.tolist()}"
+        )
+
+    data = (
+        data.sort_values("date")
+        .drop_duplicates("date")
+        .set_index("date")
+        .asfreq("MS")
+    )
+
+    for col in data.columns:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    return data
+
+
+raw = load_macro_data()
+
+# ============================================================
+# 3. FEATURE ENGINEERING
+# ============================================================
+
+def make_features(raw_data):
+    d = raw_data.copy()
+
+    # Fare CPI inflation measures.
+    d["fare_yoy"] = d[FARE_COL].pct_change(12) * 100
+    d["fare_mom"] = d[FARE_COL].pct_change() * 100
+
+    # Fare history. Shift by one month: at origin t, the latest
+    # predictor is the value from t-1.
+    for lag in [1, 2, 3, 6, 9, 12]:
+        d[f"fare_yoy_lag{lag}"] = d["fare_yoy"].shift(lag)
+        d[f"fare_mom_lag{lag}"] = d["fare_mom"].shift(lag)
+
+    # Fuel levels and percentage changes.
+    d["fuel_change_1m"] = d[FUEL_COL].pct_change(1) * 100
+    d["fuel_change_3m"] = d[FUEL_COL].pct_change(3) * 100
+    d["fuel_change_6m"] = d[FUEL_COL].pct_change(6) * 100
+    d["fuel_change_12m"] = d[FUEL_COL].pct_change(12) * 100
+
+    # Lag all fuel predictors by at least one month.
+    for lag in [1, 2, 3, 6, 9, 12]:
+        d[f"fuel_level_lag{lag}"] = d[FUEL_COL].shift(lag)
+        for change_col in [
+            "fuel_change_1m", "fuel_change_3m",
+            "fuel_change_6m", "fuel_change_12m",
+        ]:
+            d[f"{change_col}_lag{lag}"] = d[change_col].shift(lag)
+
+    # Asymmetric fuel movements: increases and decreases may have
+    # different relationships with airline prices.
+    d["fuel_increase_1m"] = d["fuel_change_1m"].clip(lower=0)
+    d["fuel_decrease_1m"] = (-d["fuel_change_1m"]).clip(lower=0)
+    for lag in [1, 2, 3]:
+        d[f"fuel_increase_lag{lag}"] = d["fuel_increase_1m"].shift(lag)
+        d[f"fuel_decrease_lag{lag}"] = d["fuel_decrease_1m"].shift(lag)
+
+    # Rolling fuel conditions. Shift the rolling statistics so they
+    # use only observations available before the forecast month.
+    d["fuel_mean_3m_lag1"] = (
+        d[FUEL_COL].rolling(3).mean().shift(1)
+    )
+    d["fuel_mean_6m_lag1"] = (
+        d[FUEL_COL].rolling(6).mean().shift(1)
+    )
+    d["fuel_volatility_6m_lag1"] = (
+        d["fuel_change_1m"].rolling(6).std().shift(1)
+    )
+
+    # Macro variables, also lagged one month.
+    if "unemployment" in d.columns:
+        d["unemployment_lag1"] = d["unemployment"].shift(1)
+        d["unemployment_change_lag1"] = (
+            d["unemployment"].diff().shift(1)
+        )
+
+    if "core_cpi" in d.columns:
+        d["core_cpi_yoy"] = d["core_cpi"].pct_change(12) * 100
+        d["core_cpi_yoy_lag1"] = d["core_cpi_yoy"].shift(1)
+
+    # Seasonality is known in advance.
+    month = d.index.month
+    d["month_sin"] = np.sin(2 * np.pi * month / 12)
+    d["month_cos"] = np.cos(2 * np.pi * month / 12)
+
+    # Structural-period indicator and interaction. The interaction
+    # uses lagged fuel changes, not contemporaneous fuel changes.
+    d["post_2020"] = (d.index >= pd.Timestamp("2020-01-01")).astype(int)
+    d["fuel_change_post2020"] = (
+        d["fuel_change_1m_lag1"] * d["post_2020"]
+    )
+
+    # Feature groups for controlled experiments.
+    fare = [
+        "fare_yoy_lag1", "fare_yoy_lag2", "fare_yoy_lag3",
+        "fare_yoy_lag6", "fare_yoy_lag9", "fare_yoy_lag12",
+        "fare_mom_lag1", "fare_mom_lag2", "fare_mom_lag3",
+        "fare_mom_lag6", "fare_mom_lag9", "fare_mom_lag12",
+        "month_sin", "month_cos",
+    ]
+
+    fuel_levels = [
+        "fuel_level_lag1", "fuel_level_lag2",
+        "fuel_level_lag3", "fuel_level_lag6",
+        "fuel_level_lag9", "fuel_level_lag12",
+        "fuel_mean_3m_lag1", "fuel_mean_6m_lag1",
+    ]
+
+    fuel_changes = [
+        "fuel_change_1m_lag1", "fuel_change_3m_lag1",
+        "fuel_change_6m_lag1", "fuel_change_12m_lag1",
+        "fuel_change_1m_lag2", "fuel_change_3m_lag2",
+        "fuel_change_1m_lag3", "fuel_change_3m_lag3",
+        "fuel_volatility_6m_lag1",
+    ]
+
+    fuel_asymmetric = [
+        "fuel_increase_lag1", "fuel_increase_lag2",
+        "fuel_increase_lag3", "fuel_decrease_lag1",
+        "fuel_decrease_lag2", "fuel_decrease_lag3",
+        "fuel_change_post2020", "post_2020",
+    ]
+
+    macro = [
+        c for c in [
+            "unemployment_lag1",
+            "unemployment_change_lag1",
+            "core_cpi_yoy_lag1",
+        ] if c in d.columns
+    ]
+
+    feature_sets = {
+        "Fare only": fare,
+        "Fare + fuel levels": fare + fuel_levels,
+        "Fare + fuel changes": fare + fuel_changes,
+        "Fare + asymmetric fuel": (
+            fare + fuel_changes + fuel_asymmetric
+        ),
+        "Fare + full fuel": (
+            fare + fuel_levels + fuel_changes + fuel_asymmetric
+        ),
+        "Fare + fuel + macro": (
+            fare + fuel_levels + fuel_changes
+            + fuel_asymmetric + macro
+        ),
+    }
+
+    # Keep only columns that exist in this dataset.
+    feature_sets = {
+        name: [c for c in cols if c in d.columns]
+        for name, cols in feature_sets.items()
+    }
+
+    d = d.replace([np.inf, -np.inf], np.nan)
+    return d, feature_sets
+
+
+df, FEATURE_SETS = make_features(raw)
+
+# ============================================================
+# 4. MODELS AND EXPANDING-WINDOW BACKTEST
+# ============================================================
+
+def make_model(model_type):
+    if model_type == "Linear Regression":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            LinearRegression(),
+        )
+
+    if model_type == "Random Forest":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            RandomForestRegressor(
+                n_estimators=500,
+                min_samples_leaf=3,
+                max_features=0.8,
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            ),
+        )
+
+    if model_type == "Gradient Boosting":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            HistGradientBoostingRegressor(
+                max_iter=250,
+                learning_rate=0.04,
+                max_leaf_nodes=15,
+                l2_regularization=1.0,
+                random_state=RANDOM_STATE,
+            ),
+        )
+
+    raise ValueError(f"Unknown model type: {model_type}")
+
+
+def run_backtest():
+    output = []
+
+    for horizon in HORIZONS:
+        work = df.copy()
+
+        # Future cumulative percentage change in airline CPI.
+        work["target"] = (
+            work[FARE_COL].shift(-horizon) / work[FARE_COL] - 1
+        ) * 100
+
+        # Retain rows with an observed target. Feature missingness is
+        # handled inside the model's imputer, but target cannot be missing.
+        usable = work.dropna(subset=["target"]).copy()
+        usable = usable.iloc[12:]
+
+        if len(usable) < 60:
+            print(
+                f"Warning: limited observations for {horizon}-month "
+                f"horizon ({len(usable)} rows)."
+            )
+
+        splitter = TimeSeriesSplit(n_splits=N_SPLITS)
+
+        for fold, (train_idx, test_idx) in enumerate(
+            splitter.split(usable), start=1
+        ):
+            train = usable.iloc[train_idx].copy()
+            test = usable.iloc[test_idx].copy()
+
+            # Purge training observations whose future target would
+            # not yet be known at the first date in the test fold.
+            first_test_date = test.index[0]
+            latest_train_target_date = (
+                train.index + pd.DateOffset(months=horizon)
+            )
+            train = train.loc[
+                latest_train_target_date <= first_test_date
+            ]
+
+            if len(train) < 30:
+                continue
+
+            y_train = train["target"]
+            y_test = test["target"]
+
+            # Zero-change benchmark.
+            naive_prediction = np.zeros(len(test))
+            for date, actual, pred in zip(
+                test.index, y_test.to_numpy(), naive_prediction
+            ):
+                output.append({
+                    "date": date, "horizon": horizon,
+                    "model": "Naive (zero change)",
+                    "feature_set": "None", "fold": fold,
+                    "actual": actual, "predicted": pred,
+                })
+
+            # Fare-only linear regression benchmark.
+            fare_features = FEATURE_SETS["Fare only"]
+            linear = make_model("Linear Regression")
+            linear.fit(train[fare_features], y_train)
+            linear_pred = linear.predict(test[fare_features])
+
+            for date, actual, pred in zip(
+                test.index, y_test.to_numpy(), linear_pred
+            ):
+                output.append({
+                    "date": date, "horizon": horizon,
+                    "model": "Linear Regression",
+                    "feature_set": "Fare only", "fold": fold,
+                    "actual": actual, "predicted": pred,
+                })
+
+            # Compare the same Random Forest algorithm across feature sets.
+            for set_name, features in FEATURE_SETS.items():
+                if not features:
+                    continue
+
+                model = make_model("Random Forest")
+                model.fit(train[features], y_train)
+                pred = model.predict(test[features])
+
+                for date, actual, prediction in zip(
+                    test.index, y_test.to_numpy(), pred
+                ):
+                    output.append({
+                        "date": date, "horizon": horizon,
+                        "model": "Random Forest",
+                        "feature_set": set_name, "fold": fold,
+                        "actual": actual, "predicted": prediction,
+                    })
+
+            # Gradient boosting is evaluated on the full fuel feature set.
+            full_features = FEATURE_SETS["Fare + full fuel"]
+            if full_features:
+                model = make_model("Gradient Boosting")
+                model.fit(train[full_features], y_train)
+                pred = model.predict(test[full_features])
+
+                for date, actual, prediction in zip(
+                    test.index, y_test.to_numpy(), pred
+                ):
+                    output.append({
+                        "date": date, "horizon": horizon,
+                        "model": "Gradient Boosting",
+                        "feature_set": "Fare + full fuel", "fold": fold,
+                        "actual": actual, "predicted": prediction,
+                    })
+
+    if not output:
+        raise RuntimeError(
+            "No backtest predictions were generated. Check data length, "
+            "date range, and feature columns."
+        )
+
+    return pd.DataFrame(output)
+
+
+predictions = run_backtest()
+predictions.to_csv(RESULTS_DIR / "backtest_predictions.csv", index=False)
+
+# ============================================================
+# 5. METRICS
+# ============================================================
+
+def calculate_metrics(data, group_columns):
+    rows = []
+    for keys, group in data.groupby(group_columns):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        rows.append({
+            **dict(zip(group_columns, keys)),
+            "MAE": mean_absolute_error(
+                group["actual"], group["predicted"]
+            ),
+            "RMSE": np.sqrt(mean_squared_error(
+                group["actual"], group["predicted"]
+            )),
+            "N": len(group),
+        })
+
+    return pd.DataFrame(rows)
+
+
+metrics = calculate_metrics(
+    predictions, ["horizon", "model", "feature_set"]
+)
+metrics.to_csv(RESULTS_DIR / "model_metrics.csv", index=False)
+
+print("\nOUT-OF-SAMPLE MODEL PERFORMANCE")
+print(
+    metrics.sort_values(["horizon", "MAE"])
+    .round(3)
+    .to_string(index=False)
+)
+
+# Calculate fuel value added relative to the fare-only RF model.
+rf_metrics = metrics[metrics["model"] == "Random Forest"].copy()
+baseline = (
+    rf_metrics[rf_metrics["feature_set"] == "Fare only"]
+    [["horizon", "MAE", "RMSE"]]
+    .rename(columns={"MAE": "baseline_MAE", "RMSE": "baseline_RMSE"})
+)
+
+fuel_comparison = rf_metrics.merge(baseline, on="horizon")
+fuel_comparison["MAE_improvement_pct"] = (
+    (fuel_comparison["baseline_MAE"] - fuel_comparison["MAE"])
+    / fuel_comparison["baseline_MAE"] * 100
+)
+fuel_comparison["RMSE_improvement_pct"] = (
+    (fuel_comparison["baseline_RMSE"] - fuel_comparison["RMSE"])
+    / fuel_comparison["baseline_RMSE"] * 100
+)
+fuel_comparison.to_csv(
+    RESULTS_DIR / "fuel_feature_value_added.csv", index=False
+)
+
+print("\nFUEL FEATURE VALUE ADDED (positive = improvement)")
+print(
+    fuel_comparison[
+        ["horizon", "feature_set", "MAE_improvement_pct",
+         "RMSE_improvement_pct"]
+    ].round(2).to_string(index=False)
+)
+
+# ============================================================
+# 6. POST-2020 / PRE-2020 PERFORMANCE
+# ============================================================
+
+predictions["period"] = np.where(
+    pd.to_datetime(predictions["date"]) >= pd.Timestamp("2020-01-01"),
+    "2020 onward",
+    "Before 2020",
+)
+
+period_metrics = calculate_metrics(
+    predictions,
+    ["horizon", "model", "feature_set", "period"],
+)
+period_metrics.to_csv(
+    RESULTS_DIR / "pre_post_2020_metrics.csv", index=False
+)
+
+print("\nPRE-2020 VS 2020-ONWARD PERFORMANCE")
+print(
+    period_metrics.sort_values(
+        ["horizon", "period", "MAE"]
+    ).round(3).to_string(index=False)
+)
+
+# ============================================================
+# 7. FIGURES
+# ============================================================
+
+# Figure 1: compare RF feature sets by horizon.
+for metric_name in ["MAE", "RMSE"]:
+    plot_data = rf_metrics.pivot(
+        index="feature_set", columns="horizon", values=metric_name
+    )
+    ax = plot_data.plot(kind="bar", figsize=(12, 6))
+    ax.set_title(f"Random Forest {metric_name} by Feature Set")
+    ax.set_xlabel("")
+    ax.set_ylabel(f"{metric_name} (percentage points)")
+    ax.legend(title="Forecast horizon (months)")
+    ax.tick_params(axis="x", rotation=30)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(
+        FIGURES_DIR / f"rf_{metric_name.lower()}_by_features.png",
+        dpi=300, bbox_inches="tight",
+    )
+    plt.close()
+
+# Figure 2: percentage MAE improvement from fuel features.
+for horizon in HORIZONS:
+    sub = fuel_comparison[fuel_comparison["horizon"] == horizon]
+    if sub.empty:
+        continue
+
+    ax = sub.set_index("feature_set")["MAE_improvement_pct"].plot(
+        kind="bar", figsize=(11, 5)
+    )
+    ax.axhline(0, linewidth=1)
+    ax.set_title(
+        f"MAE Improvement vs Fare-Only Random Forest ({horizon}-month)"
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("MAE improvement (%)")
+    ax.tick_params(axis="x", rotation=30)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(
+        FIGURES_DIR / f"fuel_improvement_{horizon}m.png",
+        dpi=300, bbox_inches="tight",
+    )
+    plt.close()
+
+# Figure 3: CPI and fuel levels indexed to 100 at January 2020.
+indexed = raw[[FARE_COL, FUEL_COL]].dropna().copy()
+indexed = indexed.loc[indexed.index >= "2020-01-01"]
+if not indexed.empty:
+    indexed_100 = indexed.div(indexed.iloc[0]).mul(100)
+    ax = indexed_100.plot(figsize=(11, 5))
+    ax.set_title("Airline CPI and Jet Fuel Price (Jan 2020 = 100)")
+    ax.set_ylabel("Index (January 2020 = 100)")
+    ax.set_xlabel("")
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(
+        FIGURES_DIR / "indexed_fare_and_fuel_since_2020.png",
+        dpi=300, bbox_inches="tight",
+    )
+    plt.close()
+
+# Figure 4: monthly percentage changes, avoiding misleading level correlation.
+monthly_changes = pd.DataFrame({
+    "fare_change": raw[FARE_COL].pct_change() * 100,
+    "fuel_change": raw[FUEL_COL].pct_change() * 100,
+}).dropna()
+
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.scatter(
+    monthly_changes["fuel_change"],
+    monthly_changes["fare_change"],
+    alpha=0.55,
+)
+ax.set_title("Monthly Fuel Price Changes vs Airline CPI Changes")
+ax.set_xlabel("Jet fuel monthly change (%)")
+ax.set_ylabel("Airline CPI monthly change (%)")
+ax.grid(alpha=0.25)
+plt.tight_layout()
+plt.savefig(
+    FIGURES_DIR / "monthly_fuel_vs_fare_changes.png",
+    dpi=300, bbox_inches="tight",
+)
+plt.close()
+
+# Figure 5: correlation between current fare changes and lagged fuel changes.
+lag_corr = []
+for lag in range(0, 13):
+    aligned = pd.concat([
+        (raw[FARE_COL].pct_change() * 100).rename("fare_change"),
+        (raw[FUEL_COL].pct_change() * 100).shift(lag).rename("fuel_change"),
+    ], axis=1).dropna()
+
+    lag_corr.append({
+        "fuel_lag_months": lag,
+        "correlation": aligned["fare_change"].corr(
+            aligned["fuel_change"]
+        ),
+    })
+
+lag_corr = pd.DataFrame(lag_corr)
+lag_corr.to_csv(RESULTS_DIR / "fuel_fare_lag_correlations.csv", index=False)
+
+ax = lag_corr.plot(
+    x="fuel_lag_months", y="correlation",
+    marker="o", legend=False, figsize=(9, 5)
+)
+ax.axhline(0, linewidth=1)
+ax.set_title("Correlation: Airline CPI Monthly Change vs Lagged Fuel Change")
+ax.set_xlabel("Fuel change lag (months)")
+ax.set_ylabel("Correlation")
+ax.grid(alpha=0.25)
+plt.tight_layout()
+plt.savefig(
+    FIGURES_DIR / "fuel_fare_lag_correlations.png",
+    dpi=300, bbox_inches="tight",
+)
+plt.close()
+
+# ============================================================
+# 8. SHAP: EXPLAIN THE ACTUAL FORECAST TARGET
+# ============================================================
+
+# SHAP is run for the 1-month horizon and the full-fuel RF model.
+# The model is trained on the earlier 80% and explained on the final 20%.
+try:
+    import shap
+
+    shap_horizon = 1
+    shap_features = FEATURE_SETS["Fare + full fuel"]
+
+    shap_data = df.copy()
+    shap_data["target"] = (
+        shap_data[FARE_COL].shift(-shap_horizon)
+        / shap_data[FARE_COL] - 1
+    ) * 100
+    shap_data = shap_data.dropna(subset=["target"]).iloc[12:]
+
+    split_at = int(len(shap_data) * 0.8)
+    shap_train = shap_data.iloc[:split_at]
+    shap_test = shap_data.iloc[split_at:]
+
+    # Purge training rows whose target extends into the test period.
+    if len(shap_test):
+        first_test_date = shap_test.index[0]
+        shap_train = shap_train.loc[
+            shap_train.index + pd.DateOffset(months=shap_horizon)
+            <= first_test_date
+        ]
+
+    if len(shap_train) >= 30 and len(shap_test) >= 5:
+        shap_model = RandomForestRegressor(
+            n_estimators=500,
+            min_samples_leaf=3,
+            max_features=0.8,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+        imputer = SimpleImputer(strategy="median")
+        x_train = imputer.fit_transform(shap_train[shap_features])
+        x_test = imputer.transform(shap_test[shap_features])
+
+        shap_model.fit(x_train, shap_train["target"])
+
+        explainer = shap.TreeExplainer(shap_model)
+        shap_values = explainer.shap_values(x_test)
+
+        plt.figure()
+        shap.summary_plot(
+            shap_values,
+            x_test,
+            feature_names=shap_features,
+            show=False,
+            max_display=20,
+        )
+        plt.tight_layout()
+        plt.savefig(
+            FIGURES_DIR / "shap_1m_full_fuel_forecast.png",
+            dpi=300, bbox_inches="tight",
+        )
+        plt.close("all")
+    else:
+        print("Not enough data for SHAP holdout analysis.")
+
+except ImportError:
+    print("SHAP not installed; install it with: pip install shap")
+
+# ============================================================
+# 9. FINISH
+# ============================================================
+
+print("\nCompleted.")
+print(f"Metrics and prediction files: {RESULTS_DIR}")
+print(f"Figures: {FIGURES_DIR}")
+print(
+    "\nInterpretation reminder: compare fuel feature sets against "
+    "'Fare only' on identical test dates. Fuel features are useful only "
+    "if they reduce out-of-sample error consistently."
+)

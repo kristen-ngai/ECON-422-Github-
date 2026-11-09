@@ -1,0 +1,4 @@
+horizon,comparison,baseline_MAE,fuel_MAE,MAE_improvement_pct
+1,Random Forest vs Random Forest + Fuel,2.098779324646886,2.0764305273645873,1.0648474101039185
+3,Random Forest vs Random Forest + Fuel,4.765447738874112,4.895516491408572,-2.729413051231788
+6,Random Forest vs Random Forest + Fuel,6.396901836981876,6.738175569582303,-5.334984673790823

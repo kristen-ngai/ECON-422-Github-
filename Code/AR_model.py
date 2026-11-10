@@ -538,3 +538,185 @@ plt.show()
 
 
 print("\nAll graphs saved in results/AR_superlearner/")
+
+#Shap analysis for AR model
+
+import shap
+import matplotlib.pyplot as plt
+import os
+
+# --------------------------------------------------
+# SHAP STORAGE
+# --------------------------------------------------
+
+shap_results = {
+    "ARX(1)": [],
+    "Joint Model": [],
+    "Super Learner": []
+}
+
+os.makedirs("results/AR_superlearner/SHAP", exist_ok=True)
+
+super_learner_pred = meta_model.predict(test_meta)
+
+
+# --------------------------------------------------
+# SHAP ANALYSIS: ARX(1), JOINT MODEL, SUPER LEARNER
+# --------------------------------------------------
+
+# A. ARX(1): Linear SHAP
+arx_explainer = shap.LinearExplainer(
+    arx_model,
+    X_train_arx
+)
+
+arx_shap = arx_explainer(X_test_arx)
+
+shap_results["ARX(1)"].append(
+    pd.DataFrame(
+        np.abs(arx_shap.values),
+        columns=arx_features,
+        index=X_test_arx.index
+    )
+)
+
+
+# B. JOINT MODEL: Random Forest Tree SHAP
+joint_explainer = shap.TreeExplainer(joint_model)
+
+joint_shap = joint_explainer(X_test_joint)
+
+shap_results["Joint Model"].append(
+    pd.DataFrame(
+        np.abs(joint_shap.values),
+        columns=joint_features,
+        index=X_test_joint.index
+    )
+)
+
+
+# C. SUPER LEARNER: Explain the complete ensemble
+# The input is the original fare + fuel feature set.
+# The function runs all three base models and the Ridge
+# meta-model, so SHAP explains the final ensemble forecast.
+
+def super_learner_predict(X):
+    X_frame = pd.DataFrame(
+        np.asarray(X),
+        columns=joint_features
+    )
+
+    # Predictions from the three fitted base models
+    arx_prediction = arx_model.predict(
+        X_frame[arx_features]
+    )
+
+    rf_prediction = ml_models["Random Forest"].predict(
+        X_frame[joint_features]
+    )
+
+    gb_prediction = ml_models["Gradient Boosting"].predict(
+        X_frame[joint_features]
+    )
+
+    # Combine predictions using the fitted Ridge meta-model
+    meta_input = pd.DataFrame({
+        "ARX(1)": arx_prediction,
+        "Random Forest": rf_prediction,
+        "Gradient Boosting": gb_prediction
+    })
+
+    return meta_model.predict(meta_input)
+
+
+# Use historical training observations as the background
+background = shap.sample(
+    X_train_joint,
+    min(50, len(X_train_joint)),
+    random_state=42
+)
+
+super_explainer = shap.PermutationExplainer(
+    super_learner_predict,
+    background
+)
+
+super_shap = super_explainer(
+    X_test_joint,
+    max_evals=2 * len(joint_features) + 1
+)
+
+shap_results["Super Learner"].append(
+    pd.DataFrame(
+        np.abs(super_shap.values),
+        columns=joint_features,
+        index=X_test_joint.index
+    )
+)
+
+
+# --------------------------------------------------
+# SHAP RESULTS: TOP 10 FEATURES
+# --------------------------------------------------
+
+shap_importance = {}
+
+for model_name, fold_results in shap_results.items():
+
+    # Combine out-of-sample SHAP values from all folds
+    combined_shap = pd.concat(fold_results)
+
+    # Average absolute SHAP value across all test observations
+    importance = (
+        combined_shap.mean()
+        .sort_values(ascending=False)
+    )
+
+    shap_importance[model_name] = importance
+
+    # Keep only the top 10 features
+    top_10 = importance.head(10)
+
+    print(f"\nTOP 10 SHAP FEATURES: {model_name}")
+    print(top_10.round(4))
+
+    # Plot
+    plt.figure(figsize=(9, 5))
+
+    top_10.sort_values().plot(
+        kind="barh"
+    )
+
+    plt.title(f"Top 10 SHAP Features: {model_name}")
+    plt.xlabel("Mean Absolute SHAP Value")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+
+    filename = (
+        model_name.lower()
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+    plt.savefig(
+        f"results/AR_superlearner/SHAP/{filename}_top10.png",
+        dpi=300
+    )
+
+    plt.show()
+
+
+# --------------------------------------------------
+# COMBINED SHAP IMPORTANCE TABLE
+# --------------------------------------------------
+
+shap_comparison = pd.DataFrame(shap_importance).fillna(0)
+
+shap_comparison.to_csv(
+    "results/AR_superlearner/SHAP/shap_comparison.csv"
+)
+
+print("\nSHAP IMPORTANCE COMPARISON")
+print(shap_comparison.round(4).head(15))
+

@@ -1,0 +1,102 @@
+# Predict next month's airline fare inflation
+df["target_next_month"] = df["fare_yoy"].shift(-1)
+
+# Use only predictors available at the forecast origin
+shap_data = df.dropna(
+    subset=all_features + ["target_next_month"]
+).copy()
+
+X = shap_data[all_features]
+y = shap_data["target_next_month"]
+
+# Chronological 80/20 split — no random shuffling
+split = int(len(shap_data) * 0.8)
+
+X_train, X_test = X.iloc[:split], X.iloc[split:]
+y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+import shap
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def summarize_shap(shap_values, X_test, model_name, top_n=10):
+
+    # Mean absolute SHAP value for each feature
+    importance = pd.DataFrame({
+        "Feature": X_test.columns,
+        "Mean_Absolute_SHAP": abs(shap_values.values).mean(axis=0)
+    })
+
+    importance = importance.sort_values(
+        "Mean_Absolute_SHAP",
+        ascending=False
+    ).head(top_n)
+
+    print(f"\nTop {top_n} SHAP Features — {model_name}")
+    print(importance.to_string(index=False))
+
+    # Plot only the most important features
+    plt.figure(figsize=(9, 5))
+    plt.barh(
+        importance["Feature"][::-1],
+        importance["Mean_Absolute_SHAP"][::-1]
+    )
+    plt.xlabel("Mean Absolute SHAP Value")
+    plt.title(f"Top {top_n} Features — {model_name}")
+    plt.tight_layout()
+    plt.show()
+
+    return importance
+
+# 1. ARX(1): Linear model
+arx_explainer = shap.LinearExplainer(
+    arx_model,
+    X_train[arx_features]
+)
+
+arx_shap = arx_explainer(X_test[arx_features])
+
+arx_importance = summarize_shap(
+    arx_shap,
+    X_test[arx_features],
+    "ARX(1)"
+)
+
+
+# 2. Joint Model: Random Forest
+joint_explainer = shap.TreeExplainer(joint_model)
+
+joint_shap = joint_explainer(
+    X_test[joint_features]
+)
+
+joint_importance = summarize_shap(
+    joint_shap,
+    X_test[joint_features],
+    "Joint Model"
+)
+
+
+# 3. Super Learner: explain the complete ensemble
+def super_learner_predict(X):
+    return super_learner.predict(
+        pd.DataFrame(X, columns=all_features)
+    )
+
+background = shap.sample(X_train[all_features], 50)
+
+super_explainer = shap.PermutationExplainer(
+    super_learner_predict,
+    background
+)
+
+super_shap = super_explainer(
+    X_test[all_features],
+    max_evals=2 * len(all_features) + 1
+)
+
+super_importance = summarize_shap(
+    super_shap,
+    X_test[all_features],
+    "Super Learner"
+)

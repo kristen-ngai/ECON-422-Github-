@@ -1,0 +1,1139 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+from itertools import combinations
+from sklearn.base import clone
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.linear_model import (
+    LinearRegression,
+    Ridge,
+    RidgeCV,
+    LassoCV
+)
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    HistGradientBoostingRegressor
+)
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error
+)
+from pathlib import Path
+
+# ==========================================================
+# 1. PROJECT PATHS AND AUTOMATIC DATA LOADING
+# ==========================================================
+
+# Find the project root automatically by locating data/processed.
+SCRIPT_DIR = Path(__file__).resolve().parent
+BASE_DIR = next(
+    (
+        parent for parent in [SCRIPT_DIR, *SCRIPT_DIR.parents]
+        if (parent / "data" / "processed" / "forecast_features.csv").exists()
+    ),
+    None
+)
+
+if BASE_DIR is None:
+    raise FileNotFoundError(
+        "Could not locate the project root. Expected to find "
+        "'data/processed/forecast_features.csv' in this script's "
+        "folder or one of its parent folders."
+    )
+
+DATA_DIR = BASE_DIR / "data" / "processed"
+FRED_FILE = DATA_DIR / "forecast_features.csv"
+
+OUTPUT_DIR = BASE_DIR / "results" / "AR_superlearner" / "extended_analysis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+output_dir = OUTPUT_DIR  # Keep the existing save statements compatible.
+
+print("Project directory:", BASE_DIR)
+print("Input data:", FRED_FILE)
+print("Economic data exists:", FRED_FILE.exists())
+print("Results will be saved to:", OUTPUT_DIR)
+
+# Load the processed economic/fare feature file.
+raw_data = pd.read_csv(FRED_FILE)
+
+# Identify and parse the date column.
+date_candidates = ["date", "Date", "observation_date", "month"]
+date_col = next((col for col in date_candidates if col in raw_data.columns), None)
+
+if date_col is not None:
+    raw_data[date_col] = pd.to_datetime(raw_data[date_col], errors="coerce")
+    raw_data = raw_data.dropna(subset=[date_col])
+    raw_data = raw_data.sort_values(date_col).set_index(date_col)
+elif "Unnamed: 0" in raw_data.columns:
+    parsed_dates = pd.to_datetime(raw_data["Unnamed: 0"], errors="coerce")
+    if parsed_dates.notna().all():
+        raw_data = raw_data.drop(columns=["Unnamed: 0"])
+        raw_data.index = parsed_dates
+        raw_data.index.name = "Date"
+
+if not raw_data.index.is_monotonic_increasing:
+    raw_data = raw_data.sort_index()
+
+# The model predicts next month's year-over-year airline fare inflation.
+target_col = "fare_inflation_yoy"
+
+if target_col not in raw_data.columns:
+    raise KeyError(
+        f"'{target_col}' was not found in forecast_features.csv. "
+        f"Available columns: {raw_data.columns.tolist()}"
+    )
+
+if "target_next_month" in raw_data.columns:
+    target_series = raw_data["target_next_month"]
+else:
+    target_series = raw_data[target_col].shift(-1)
+
+# Keep the same feature specifications as the original analysis.
+arx_features = ["fare_lag_1", "fuel_lag_1"]
+
+joint_feature_candidates = [
+    "fare_lag_1", "fare_lag_2", "fare_lag_3",
+    "fare_lag_6", "fare_lag_12",
+    "fuel_lag_1", "fuel_lag_3", "fuel_lag_6"
+]
+joint_features = [
+    feature for feature in joint_feature_candidates
+    if feature in raw_data.columns
+]
+
+missing_arx = [feature for feature in arx_features if feature not in raw_data.columns]
+if missing_arx:
+    raise KeyError(
+        f"Required ARX(1) feature(s) missing from forecast_features.csv: "
+        f"{missing_arx}. Available columns: {raw_data.columns.tolist()}"
+    )
+
+if not joint_features:
+    raise KeyError(
+        "None of the expected fare/fuel lag features were found in "
+        "forecast_features.csv."
+    )
+
+# Build one aligned modeling dataset so X_arx, X_joint, and y
+# always have identical dates, row order, and observation counts.
+required_columns = list(dict.fromkeys(arx_features + joint_features))
+model_data = raw_data[required_columns].copy()
+model_data["target_next_month"] = target_series
+model_data = model_data.replace([np.inf, -np.inf], np.nan).dropna()
+
+data = model_data.copy()
+X_arx = data[arx_features].copy()
+X_joint = data[joint_features].copy()
+y = data["target_next_month"].copy()
+
+if len(data) <= 50:
+    raise ValueError(
+        f"Only {len(data)} complete observations are available. "
+        "The five-fold time-series CV and GARCH analysis need a longer series."
+    )
+
+print(f"Loaded observations: {len(data)}")
+print(f"Date range: {data.index.min()} to {data.index.max()}")
+print("ARX(1) covariates:", arx_features)
+print("Joint RF/GB covariates:", joint_features)
+print("Modeling target: next-month fare_inflation_yoy")
+
+# Save a record of the exact modeling sample and features.
+pd.DataFrame({
+    "Item": ["Input file", "Target", "ARX features", "Joint features", "Observations"],
+    "Value": [
+        str(FRED_FILE),
+        "target_next_month (fare_inflation_yoy shifted by -1)",
+        ", ".join(arx_features),
+        ", ".join(joint_features),
+        len(data)
+    ]
+}).to_csv(OUTPUT_DIR / "analysis_setup.csv", index=False)
+
+
+# ==========================================================
+# 2. MODEL DEFINITIONS AND HYPERPARAMETER GRIDS
+# ==========================================================
+
+
+outer_cv = TimeSeriesSplit(n_splits=5)
+inner_cv = TimeSeriesSplit(n_splits=4)
+
+# ARX(1) is a linear regression with fare and fuel lags.
+# It has no tuning parameters in this specification.
+
+rf_grid = {
+    "n_estimators": [200, 300, 400],
+    "max_depth": [None, 5, 10],
+    "min_samples_leaf": [2, 3, 5],
+    "max_features": ["sqrt", 1.0]
+}
+
+gb_grid = {
+    "max_iter": [100, 200, 300],
+    "learning_rate": [0.03, 0.05, 0.1],
+    "max_leaf_nodes": [7, 15, 31],
+    "l2_regularization": [0.0, 0.1, 1.0]
+}
+
+# All possible Super Learner combinations
+base_names = [
+    "ARX(1)",
+    "Random Forest",
+    "Gradient Boosting"
+]
+
+ensemble_variants = {}
+
+for r in [1, 2, 3]:
+    for subset in combinations(base_names, r):
+        name = " + ".join(subset)
+        ensemble_variants[name] = list(subset)
+
+
+# ==========================================================
+# 3. STORAGE
+# ==========================================================
+
+all_results = []
+prediction_records = []
+hyperparameter_records = []
+arx_coefficient_records = []
+ensemble_coefficient_records = []
+
+
+# ==========================================================
+# 4. EXPANDING-WINDOW CROSS VALIDATION
+# ==========================================================
+for fold, (train_idx, test_idx) in enumerate(
+    outer_cv.split(X_joint), start=1
+):
+
+    print(f"\nProcessing outer fold {fold}/5")
+
+    X_train_arx = X_arx.iloc[train_idx]
+    X_test_arx = X_arx.iloc[test_idx]
+
+    X_train_joint = X_joint.iloc[train_idx]
+    X_test_joint = X_joint.iloc[test_idx]
+
+    y_train = y.iloc[train_idx]
+    y_test = y.iloc[test_idx]
+
+    # ------------------------------------------------------
+    # A. TUNE RANDOM FOREST
+    # ------------------------------------------------------
+
+    rf_search = GridSearchCV(
+        estimator=RandomForestRegressor(
+            random_state=42,
+            n_jobs=-1
+        ),
+        param_grid=rf_grid,
+        scoring="neg_mean_absolute_error",
+        cv=inner_cv,
+        n_jobs=-1,
+        refit=True
+    )
+
+    rf_search.fit(X_train_joint, y_train)
+
+    best_rf = rf_search.best_estimator_
+
+    # ------------------------------------------------------
+    # B. TUNE GRADIENT BOOSTING
+    # ------------------------------------------------------
+
+    gb_search = GridSearchCV(
+        estimator=HistGradientBoostingRegressor(
+            random_state=42
+        ),
+        param_grid=gb_grid,
+        scoring="neg_mean_absolute_error",
+        cv=inner_cv,
+        n_jobs=-1,
+        refit=True
+    )
+
+    gb_search.fit(X_train_joint, y_train)
+
+    best_gb = gb_search.best_estimator_
+
+    # ------------------------------------------------------
+    # C. FIT ARX(1)
+    # ------------------------------------------------------
+
+    arx_model = LinearRegression()
+
+    arx_model.fit(X_train_arx, y_train)
+
+    arx_pred = arx_model.predict(X_test_arx)
+
+    arx_coefficient_records.append({
+        "Fold": fold,
+        "Intercept": arx_model.intercept_,
+        "Fare_lag_1": arx_model.coef_[0],
+        "Fuel_lag_1": arx_model.coef_[1]
+    })
+
+    # ------------------------------------------------------
+    # D. FIT INDIVIDUAL ML MODELS
+    # ------------------------------------------------------
+
+    best_rf.fit(X_train_joint, y_train)
+    best_gb.fit(X_train_joint, y_train)
+
+    rf_pred = best_rf.predict(X_test_joint)
+    gb_pred = best_gb.predict(X_test_joint)
+
+    # Save selected hyperparameters
+    hyperparameter_records.extend([
+        {
+            "Fold": fold,
+            "Model": "ARX(1)",
+            "Best_Parameters": "Ordinary Least Squares"
+        },
+        {
+            "Fold": fold,
+            "Model": "Random Forest",
+            "Best_Parameters": str(rf_search.best_params_)
+        },
+        {
+            "Fold": fold,
+            "Model": "Gradient Boosting",
+            "Best_Parameters": str(gb_search.best_params_)
+        }
+    ])
+
+    # ------------------------------------------------------
+    # E. GENERATE OUT-OF-FOLD BASE MODEL PREDICTIONS
+    # ------------------------------------------------------
+
+    # These train the Super Learner meta-model.
+    # The outer test set is not used to train the meta-model.
+
+    oof_predictions = pd.DataFrame(
+        index=X_train_arx.index,
+        columns=base_names,
+        dtype=float
+    )
+
+    for inner_train_idx, inner_val_idx in inner_cv.split(
+        X_train_arx
+    ):
+
+        Xi_arx_train = X_train_arx.iloc[inner_train_idx]
+        Xi_arx_val = X_train_arx.iloc[inner_val_idx]
+
+        Xi_joint_train = X_train_joint.iloc[inner_train_idx]
+        Xi_joint_val = X_train_joint.iloc[inner_val_idx]
+
+        yi_train = y_train.iloc[inner_train_idx]
+
+        # ARX
+        inner_arx = LinearRegression()
+        inner_arx.fit(Xi_arx_train, yi_train)
+
+        oof_predictions.iloc[inner_val_idx, 0] = (
+            inner_arx.predict(Xi_arx_val)
+        )
+
+        # RF: use selected hyperparameters
+        inner_rf = clone(best_rf)
+        inner_rf.fit(Xi_joint_train, yi_train)
+
+        oof_predictions.iloc[inner_val_idx, 1] = (
+            inner_rf.predict(Xi_joint_val)
+        )
+
+        # GB: use selected hyperparameters
+        inner_gb = clone(best_gb)
+        inner_gb.fit(Xi_joint_train, yi_train)
+
+        oof_predictions.iloc[inner_val_idx, 2] = (
+            inner_gb.predict(Xi_joint_val)
+        )
+
+    valid_oof = oof_predictions.dropna()
+
+    y_meta = y_train.loc[valid_oof.index]
+
+    # ------------------------------------------------------
+    # F. TEST ALL SEVEN ENSEMBLE VARIATIONS
+    # ------------------------------------------------------
+
+    base_test_predictions = {
+        "ARX(1)": arx_pred,
+        "Random Forest": rf_pred,
+        "Gradient Boosting": gb_pred
+    }
+
+    # Include individual models as benchmarks
+    predictions = {
+        "ARX(1)": arx_pred,
+        "Random Forest": rf_pred,
+        "Gradient Boosting": gb_pred
+    }
+
+    for variant_name, components in ensemble_variants.items():
+
+        if len(components) == 1:
+            # A one-model combination equals the base model.
+            continue
+
+        # OOF predictions used to train meta-model
+        meta_train = valid_oof[components]
+
+        # Ridge meta-model combines base model predictions
+        meta_model = RidgeCV(
+            alphas=[0.01, 0.1, 1.0, 10.0, 100.0]
+        )
+
+        meta_model.fit(meta_train, y_meta)
+
+        # Test predictions from the same component models
+        meta_test = pd.DataFrame(
+            {
+                component: base_test_predictions[component]
+                for component in components
+            },
+            index=X_test_arx.index
+        )
+
+        variant_pred = meta_model.predict(meta_test)
+
+        predictions[variant_name] = variant_pred
+
+        for component, coefficient in zip(
+            components, meta_model.coef_
+        ):
+            ensemble_coefficient_records.append({
+                "Fold": fold,
+                "Ensemble": variant_name,
+                "Base_Model": component,
+                "Meta_Coefficient": coefficient,
+                "Meta_Alpha": meta_model.alpha_
+            })
+
+        hyperparameter_records.append({
+            "Fold": fold,
+            "Model": variant_name,
+            "Best_Parameters": (
+                f"Ridge alpha={meta_model.alpha_}"
+            )
+        })
+
+    # ------------------------------------------------------
+    # G. EVALUATE ALL MODELS
+    # ------------------------------------------------------
+
+    for model_name, pred in predictions.items():
+
+        errors = np.asarray(y_test) - np.asarray(pred)
+
+        mae = mean_absolute_error(y_test, pred)
+
+        rmse = np.sqrt(
+            mean_squared_error(y_test, pred)
+        )
+
+        # Volatility of out-of-sample forecast errors
+        error_volatility = np.std(errors, ddof=1)
+
+        # Volatility of forecast values
+        prediction_volatility = np.std(pred, ddof=1)
+
+        all_results.append({
+            "Fold": fold,
+            "Model": model_name,
+            "MAE": mae,
+            "RMSE": rmse,
+            "Error_Volatility": error_volatility,
+            "Prediction_Volatility": prediction_volatility
+        })
+
+        for date, actual, forecast in zip(
+            y_test.index, y_test, pred
+        ):
+            prediction_records.append({
+                "Date": date,
+                "Fold": fold,
+                "Model": model_name,
+                "Actual": actual,
+                "Predicted": forecast,
+                "Error": actual - forecast
+            })
+
+
+# ==========================================================
+# 5. SUMMARIZE CROSS-VALIDATION RESULTS
+# ==========================================================
+
+results_df = pd.DataFrame(all_results)
+predictions_df = pd.DataFrame(prediction_records)
+
+summary = (
+    results_df.groupby("Model")
+    .agg(
+        MAE=("MAE", "mean"),
+        RMSE=("RMSE", "mean"),
+        Error_Volatility=("Error_Volatility", "mean"),
+        Prediction_Volatility=("Prediction_Volatility", "mean")
+    )
+    .sort_values("MAE")
+)
+
+print("\nMODEL COMPARISON")
+print(summary.round(4))
+
+summary.to_csv(
+    f"{output_dir}/model_performance_summary.csv"
+)
+
+results_df.to_csv(
+    f"{output_dir}/fold_level_performance.csv",
+    index=False
+)
+
+predictions_df.to_csv(
+    f"{output_dir}/out_of_sample_predictions.csv",
+    index=False
+)
+
+pd.DataFrame(hyperparameter_records).to_csv(
+    f"{output_dir}/hyperparameters_by_fold.csv",
+    index=False
+)
+
+pd.DataFrame(arx_coefficient_records).to_csv(
+    f"{output_dir}/ARX_coefficients_by_fold.csv",
+    index=False
+)
+
+pd.DataFrame(ensemble_coefficient_records).to_csv(
+    f"{output_dir}/ensemble_meta_coefficients.csv",
+    index=False
+)
+
+print("\nSaved model comparison and tuning results.")
+
+# ==========================================================
+# COVARIATE REPORT
+# ==========================================================
+
+covariate_report = pd.DataFrame([
+    {
+        "Model": "ARX(1)",
+        "Covariates": ", ".join(arx_features)
+    },
+    {
+        "Model": "Random Forest",
+        "Covariates": ", ".join(joint_features)
+    },
+    {
+        "Model": "Gradient Boosting",
+        "Covariates": ", ".join(joint_features)
+    },
+    {
+        "Model": "SL: ARX + RF",
+        "Covariates": "ARX prediction + RF prediction"
+    },
+    {
+        "Model": "SL: ARX + GB",
+        "Covariates": "ARX prediction + GB prediction"
+    },
+    {
+        "Model": "SL: RF + GB",
+        "Covariates": "RF prediction + GB prediction"
+    },
+    {
+        "Model": "SL: ARX + RF + GB",
+        "Covariates": (
+            "ARX prediction + RF prediction + GB prediction"
+        )
+    }
+])
+
+covariate_report.to_csv(
+    f"{output_dir}/covariate_report.csv",
+    index=False
+)
+
+print(covariate_report.to_string(index=False))
+
+
+# ==========================================================
+# 6. SELECT MODEL USING MAE, RMSE, AND ERROR VOLATILITY
+# ==========================================================
+
+ranked = summary.copy()
+
+ranked["MAE_Rank"] = ranked["MAE"].rank()
+ranked["RMSE_Rank"] = ranked["RMSE"].rank()
+ranked["Volatility_Rank"] = (
+    ranked["Error_Volatility"].rank()
+)
+
+ranked["Average_Rank"] = ranked[
+    ["MAE_Rank", "RMSE_Rank", "Volatility_Rank"]
+].mean(axis=1)
+
+ranked = ranked.sort_values("Average_Rank")
+
+selected_model = ranked.index[0]
+
+print("\nSELECTED MODEL:", selected_model)
+print(ranked.round(4))
+
+ranked.to_csv(
+    f"{output_dir}/model_selection_ranking.csv"
+)
+
+
+# ==========================================================
+# 7. CHOOSE THE SELECTED MODEL'S INPUT FEATURES
+# ==========================================================
+
+if selected_model == "ARX(1)":
+    selected_features = arx_features
+else:
+    # RF, GB, and all ensemble variants use joint features
+    selected_features = joint_features
+
+X_selected = data[selected_features]
+y_selected = y
+
+
+# ==========================================================
+# 8. LASSO AND RIDGE REGULARIZATION
+# ==========================================================
+
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+regularized_models = {
+    "Lasso": make_pipeline(
+        StandardScaler(),
+        LassoCV(
+            alphas=np.logspace(-4, 2, 40),
+            cv=TimeSeriesSplit(n_splits=5),
+            max_iter=20000
+        )
+    ),
+
+    "Ridge": make_pipeline(
+        StandardScaler(),
+        RidgeCV(
+            alphas=np.logspace(-4, 4, 50),
+            cv=TimeSeriesSplit(n_splits=5)
+        )
+    )
+}
+
+regularization_results = []
+regularization_predictions = []
+
+regularization_cv = TimeSeriesSplit(n_splits=5)
+
+for model_name, model in regularized_models.items():
+
+    for fold, (train_idx, test_idx) in enumerate(
+        regularization_cv.split(X_selected), start=1
+    ):
+
+        Xtr = X_selected.iloc[train_idx]
+        Xte = X_selected.iloc[test_idx]
+
+        ytr = y_selected.iloc[train_idx]
+        yte = y_selected.iloc[test_idx]
+
+        model.fit(Xtr, ytr)
+
+        pred = model.predict(Xte)
+
+        errors = yte.to_numpy() - pred
+
+        regularization_results.append({
+            "Fold": fold,
+            "Model": model_name,
+            "MAE": mean_absolute_error(yte, pred),
+            "RMSE": np.sqrt(mean_squared_error(yte, pred)),
+            "Error_Volatility": np.std(errors, ddof=1),
+            "Best_Alpha": model[-1].alpha_
+        })
+
+        for date, actual, forecast in zip(yte.index, yte, pred):
+            regularization_predictions.append({
+                "Date": date,
+                "Fold": fold,
+                "Model": model_name,
+                "Actual": actual,
+                "Predicted": forecast
+            })
+
+regularization_df = pd.DataFrame(regularization_results)
+
+regularization_summary = (
+    regularization_df.groupby("Model")
+    [["MAE", "RMSE", "Error_Volatility", "Best_Alpha"]]
+    .mean()
+)
+
+print("\nLASSO VS RIDGE")
+print(regularization_summary.round(4))
+
+regularization_summary.to_csv(
+    f"{output_dir}/lasso_ridge_summary.csv"
+)
+
+pd.DataFrame(regularization_predictions).to_csv(
+    f"{output_dir}/lasso_ridge_predictions.csv",
+    index=False
+)
+
+# ==========================================================
+# 9. ARX COEFFICIENT SUMMARY
+# ==========================================================
+
+arx_coef_df = pd.DataFrame(arx_coefficient_records)
+
+print("\nARX(1) COEFFICIENTS BY FOLD")
+print(arx_coef_df.round(5))
+
+print("\nAVERAGE ARX(1) COEFFICIENTS")
+print(
+    arx_coef_df[
+        ["Intercept", "Fare_lag_1", "Fuel_lag_1"]
+    ].mean().round(5)
+)
+
+arx_coef_df.to_csv(
+    f"{output_dir}/ARX_coefficient_details.csv",
+    index=False
+)
+
+
+# ==========================================================
+# 10. GARCH(1,1) ON SELECTED MODEL FORECAST ERRORS
+# ==========================================================
+
+from arch import arch_model
+
+# Get selected model's out-of-sample residuals
+selected_predictions = predictions_df[
+    predictions_df["Model"] == selected_model
+].copy()
+
+selected_predictions = (
+    selected_predictions.sort_values("Date")
+)
+
+residuals = selected_predictions["Error"].dropna()
+
+# GARCH works better with a sufficiently long residual series.
+if len(residuals) >= 50:
+
+    # Rescale for numerical stability
+    scaled_residuals = residuals * 100
+
+    garch_model = arch_model(
+        scaled_residuals,
+        mean="Zero",
+        vol="GARCH",
+        p=1,
+        q=1,
+        dist="t"
+    )
+
+    garch_results = garch_model.fit(
+        disp="off"
+    )
+
+    print("\nGARCH(1,1) RESULTS")
+    print(garch_results.summary())
+
+    # Save coefficient estimates
+    garch_parameters = pd.DataFrame({
+        "Parameter": garch_results.params.index,
+        "Estimate": garch_results.params.values,
+        "P_Value": garch_results.pvalues.values
+    })
+
+    garch_parameters.to_csv(
+        f"{output_dir}/GARCH_coefficients.csv",
+        index=False
+    )
+
+    # Conditional volatility
+    conditional_volatility = (
+        garch_results.conditional_volatility / 100
+    )
+
+    garch_volatility_df = pd.DataFrame({
+        "Date": selected_predictions["Date"].to_numpy(),
+        "Conditional_Volatility": np.asarray(conditional_volatility)
+    })
+
+    garch_volatility_df.to_csv(
+        f"{output_dir}/GARCH_conditional_volatility.csv",
+        index=False
+    )
+
+    plt.figure(figsize=(12, 5))
+
+    plt.plot(
+        garch_volatility_df["Date"],
+        garch_volatility_df["Conditional_Volatility"]
+    )
+
+    plt.title(
+        f"GARCH(1,1) Conditional Forecast-Error Volatility: "
+        f"{selected_model}"
+    )
+
+    plt.xlabel("Date")
+    plt.ylabel("Conditional Volatility")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(
+        f"{output_dir}/GARCH_volatility.png",
+        dpi=300
+    )
+
+    plt.show()
+
+else:
+    print(
+        "Not enough out-of-sample residual observations "
+        "for a reliable GARCH analysis."
+    )
+
+
+# ==========================================================
+# GRAPH 1: MODEL PERFORMANCE COMPARISON
+# ==========================================================
+
+metrics = ["MAE", "RMSE"]
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+for ax, metric in zip(axes, metrics):
+
+    values = summary[metric].sort_values()
+
+    values.plot(
+        kind="barh",
+        ax=ax
+    )
+
+    ax.set_title(f"Model Comparison: {metric}")
+    ax.set_xlabel(metric)
+    ax.set_ylabel("Model")
+    ax.grid(axis="x", alpha=0.3)
+
+plt.suptitle("Forecasting Performance Across Model Specifications")
+plt.tight_layout()
+
+plt.savefig(
+    f"{output_dir}/model_performance_comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ==========================================================
+# GRAPH 2: FORECAST AND ERROR VOLATILITY
+# ==========================================================
+
+volatility_metrics = [
+    "Error_Volatility",
+    "Prediction_Volatility"
+]
+
+volatility_plot = summary[volatility_metrics]
+
+ax = volatility_plot.plot(
+    kind="bar",
+    figsize=(13, 6),
+    width=0.8
+)
+
+ax.set_title("Forecast Volatility by Model")
+ax.set_xlabel("Model")
+ax.set_ylabel("Standard Deviation")
+ax.tick_params(axis="x", rotation=35)
+ax.legend([
+    "Forecast Error Volatility",
+    "Prediction Volatility"
+])
+ax.grid(axis="y", alpha=0.3)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{output_dir}/model_volatility_comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ==========================================================
+# GRAPH 3: SUPER LEARNER META-MODEL COEFFICIENTS
+# ==========================================================
+
+ensemble_coef_df = pd.DataFrame(
+    ensemble_coefficient_records
+)
+
+if not ensemble_coef_df.empty:
+
+    coef_summary = (
+        ensemble_coef_df.groupby(
+            ["Ensemble", "Base_Model"]
+        )["Meta_Coefficient"]
+        .mean()
+        .unstack(fill_value=0)
+    )
+
+    ax = coef_summary.plot(
+        kind="bar",
+        figsize=(12, 6),
+        width=0.8
+    )
+
+    ax.axhline(0, linewidth=0.8)
+    ax.set_title("Average Super Learner Meta-Model Weights")
+    ax.set_xlabel("Ensemble Specification")
+    ax.set_ylabel("Average Ridge Coefficient")
+    ax.tick_params(axis="x", rotation=30)
+    ax.legend(title="Base Model")
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.savefig(
+        f"{output_dir}/ensemble_coefficients.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+
+# ==========================================================
+# GRAPH 4: LASSO VS RIDGE
+# ==========================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+for ax, metric in zip(axes, ["MAE", "RMSE"]):
+
+    values = regularization_summary[metric]
+
+    values.plot(
+        kind="bar",
+        ax=ax
+    )
+
+    ax.set_title(f"Lasso vs Ridge: {metric}")
+    ax.set_xlabel("Regularization Method")
+    ax.set_ylabel(metric)
+    ax.tick_params(axis="x", rotation=0)
+    ax.grid(axis="y", alpha=0.3)
+
+plt.suptitle(
+    f"Regularization Performance — Selected Model: {selected_model}"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{output_dir}/lasso_ridge_comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ==========================================================
+# GRAPH 5: LASSO AND RIDGE COEFFICIENTS
+# ==========================================================
+
+# Fit both models on the full available sample for
+# descriptive coefficient visualization only.
+# Use cross-validation results above for performance claims.
+
+lasso_final = regularized_models["Lasso"]
+ridge_final = regularized_models["Ridge"]
+
+lasso_final.fit(X_selected, y_selected)
+ridge_final.fit(X_selected, y_selected)
+
+coefficient_comparison = pd.DataFrame({
+    "Feature": selected_features,
+    "Lasso": lasso_final[-1].coef_,
+    "Ridge": ridge_final[-1].coef_
+}).set_index("Feature")
+
+ax = coefficient_comparison.plot(
+    kind="bar",
+    figsize=(13, 6),
+    width=0.8
+)
+
+ax.axhline(0, linewidth=0.8)
+ax.set_title("Lasso vs Ridge: Feature Coefficients")
+ax.set_xlabel("Predictor")
+ax.set_ylabel("Standardized Coefficient")
+ax.tick_params(axis="x", rotation=40)
+ax.legend(title="Regularization")
+ax.grid(axis="y", alpha=0.3)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{output_dir}/lasso_ridge_coefficients.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ==========================================================
+# GRAPH 6: ACTUAL VS PREDICTED FARE INFLATION
+# ==========================================================
+
+plot_models = [
+    "ARX(1)",
+    "Random Forest",
+    "Gradient Boosting",
+    "ARX(1) + Random Forest + Gradient Boosting"
+]
+
+fig, axes = plt.subplots(
+    len(plot_models),
+    1,
+    figsize=(14, 14),
+    sharex=True
+)
+
+for ax, model_name in zip(axes, plot_models):
+
+    model_data = predictions_df[
+        predictions_df["Model"] == model_name
+    ].sort_values("Date")
+
+    if model_data.empty:
+        ax.set_visible(False)
+        continue
+
+    ax.plot(
+        model_data["Date"],
+        model_data["Actual"],
+        label="Actual",
+        linewidth=1.8
+    )
+
+    ax.plot(
+        model_data["Date"],
+        model_data["Predicted"],
+        label="Predicted",
+        linestyle="--",
+        linewidth=1.5
+    )
+
+    ax.set_title(model_name)
+    ax.set_ylabel("Fare Inflation (%)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+axes[-1].set_xlabel("Date")
+
+plt.suptitle(
+    "Actual vs Predicted Next-Month Airline Fare Inflation",
+    y=1.01
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{output_dir}/actual_vs_predicted.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ==========================================================
+# GRAPH 7: FORECAST ERRORS AND GARCH VOLATILITY
+# ==========================================================
+
+if "garch_volatility_df" in globals():
+
+    fig, ax1 = plt.subplots(figsize=(13, 6))
+
+    ax1.plot(
+        selected_predictions["Date"],
+        selected_predictions["Error"],
+        label="Forecast Error",
+        alpha=0.7
+    )
+
+    ax1.axhline(0, linestyle="--", linewidth=1)
+
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Forecast Error")
+    ax1.set_title(
+        "Forecast Errors and GARCH Conditional Volatility"
+    )
+
+    ax2 = ax1.twinx()
+
+    ax2.plot(
+        garch_volatility_df["Date"],
+        garch_volatility_df["Conditional_Volatility"],
+        label="GARCH Conditional Volatility",
+        linestyle="--",
+        linewidth=2
+    )
+
+    ax2.set_ylabel("Conditional Volatility")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+
+    ax1.legend(
+        lines1 + lines2,
+        labels1 + labels2,
+        loc="upper left"
+    )
+
+    ax1.grid(alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(
+        f"{output_dir}/forecast_errors_garch.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+
+# ==========================================================
+# FINAL OUTPUT LOCATION
+# ==========================================================
+
+print("\\nAnalysis complete.")
+print("All tables and graphs were saved to:")
+print(OUTPUT_DIR)

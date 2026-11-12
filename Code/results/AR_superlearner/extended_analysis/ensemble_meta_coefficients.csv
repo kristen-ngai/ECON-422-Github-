@@ -1,0 +1,46 @@
+Fold,Ensemble,Base_Model,Meta_Coefficient,Meta_Alpha
+1,ARX(1) + Random Forest,ARX(1),-0.0036965533249748717,0.1
+1,ARX(1) + Random Forest,Random Forest,2.143697452256206,0.1
+1,ARX(1) + Gradient Boosting,ARX(1),0.6784368023822187,100.0
+1,ARX(1) + Gradient Boosting,Gradient Boosting,0.23292972607830337,100.0
+1,Random Forest + Gradient Boosting,Random Forest,2.4722192682617257,1.0
+1,Random Forest + Gradient Boosting,Gradient Boosting,-0.6124499172940143,1.0
+1,ARX(1) + Random Forest + Gradient Boosting,ARX(1),0.06976397118276229,1.0
+1,ARX(1) + Random Forest + Gradient Boosting,Random Forest,2.3821151094314272,1.0
+1,ARX(1) + Random Forest + Gradient Boosting,Gradient Boosting,-0.6310805291017512,1.0
+2,ARX(1) + Random Forest,ARX(1),0.9763870757153013,100.0
+2,ARX(1) + Random Forest,Random Forest,-0.12298109940330937,100.0
+2,ARX(1) + Gradient Boosting,ARX(1),0.8077925337439582,100.0
+2,ARX(1) + Gradient Boosting,Gradient Boosting,0.26149799843383237,100.0
+2,Random Forest + Gradient Boosting,Random Forest,0.39584048058855004,100.0
+2,Random Forest + Gradient Boosting,Gradient Boosting,0.9323691116168322,100.0
+2,ARX(1) + Random Forest + Gradient Boosting,ARX(1),1.0134545989800423,10.0
+2,ARX(1) + Random Forest + Gradient Boosting,Random Forest,-0.7934393141272489,10.0
+2,ARX(1) + Random Forest + Gradient Boosting,Gradient Boosting,0.8014398672833609,10.0
+3,ARX(1) + Random Forest,ARX(1),1.1382882621030554,10.0
+3,ARX(1) + Random Forest,Random Forest,-0.23060183490524633,10.0
+3,ARX(1) + Gradient Boosting,ARX(1),0.9785980811152319,100.0
+3,ARX(1) + Gradient Boosting,Gradient Boosting,-0.027488303684039206,100.0
+3,Random Forest + Gradient Boosting,Random Forest,0.8496974040116285,100.0
+3,Random Forest + Gradient Boosting,Gradient Boosting,0.16180037277788895,100.0
+3,ARX(1) + Random Forest + Gradient Boosting,ARX(1),1.025852990985751,100.0
+3,ARX(1) + Random Forest + Gradient Boosting,Random Forest,-0.16316523152866313,100.0
+3,ARX(1) + Random Forest + Gradient Boosting,Gradient Boosting,0.07105900443770174,100.0
+4,ARX(1) + Random Forest,ARX(1),1.1851434460015156,10.0
+4,ARX(1) + Random Forest,Random Forest,-0.3446263098886888,10.0
+4,ARX(1) + Gradient Boosting,ARX(1),1.0565121545038418,100.0
+4,ARX(1) + Gradient Boosting,Gradient Boosting,-0.235340702278086,100.0
+4,Random Forest + Gradient Boosting,Random Forest,0.5256591333104739,100.0
+4,Random Forest + Gradient Boosting,Gradient Boosting,0.21240789831502616,100.0
+4,ARX(1) + Random Forest + Gradient Boosting,ARX(1),1.1163423203584983,100.0
+4,ARX(1) + Random Forest + Gradient Boosting,Random Forest,-0.24287563062548267,100.0
+4,ARX(1) + Random Forest + Gradient Boosting,Gradient Boosting,-0.043480743437486424,100.0
+5,ARX(1) + Random Forest,ARX(1),0.8368570480051822,100.0
+5,ARX(1) + Random Forest,Random Forest,0.11977373487645071,100.0
+5,ARX(1) + Gradient Boosting,ARX(1),0.839604554165964,100.0
+5,ARX(1) + Gradient Boosting,Gradient Boosting,0.1573266388735166,100.0
+5,Random Forest + Gradient Boosting,Random Forest,0.9519615909485006,100.0
+5,Random Forest + Gradient Boosting,Gradient Boosting,0.23086969827171355,100.0
+5,ARX(1) + Random Forest + Gradient Boosting,ARX(1),0.8334715354165911,100.0
+5,ARX(1) + Random Forest + Gradient Boosting,Random Forest,0.022823978042477044,100.0
+5,ARX(1) + Random Forest + Gradient Boosting,Gradient Boosting,0.14018508697147158,100.0

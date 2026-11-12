@@ -1,0 +1,8 @@
+Model,Covariates
+ARX(1),"fare_lag_1, fuel_lag_1"
+Random Forest,"fare_lag_1, fare_lag_2, fare_lag_3, fare_lag_6, fare_lag_12, fuel_lag_1, fuel_lag_3, fuel_lag_6"
+Gradient Boosting,"fare_lag_1, fare_lag_2, fare_lag_3, fare_lag_6, fare_lag_12, fuel_lag_1, fuel_lag_3, fuel_lag_6"
+SL: ARX + RF,ARX prediction + RF prediction
+SL: ARX + GB,ARX prediction + GB prediction
+SL: RF + GB,RF prediction + GB prediction
+SL: ARX + RF + GB,ARX prediction + RF prediction + GB prediction

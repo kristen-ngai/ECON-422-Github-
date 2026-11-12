@@ -1043,3 +1043,183 @@ if route_path.exists():
 print(f"\nFigures saved to: {OUTPUT_DIR}")
 print(f"Metrics saved to: {OUTPUT_DIR.parent}")
 
+
+#Additional SHAP plots
+# --------------------------------------------------
+# SHAP STORAGE
+# --------------------------------------------------
+
+shap_results = {
+    "ARX(1)": [],
+    "Joint Model": [],
+    "Super Learner": []
+    
+    
+}
+
+shap_explanations = {
+    "ARX(1)": [],
+    "Joint Model": [],
+    "Super Learner": []
+}
+
+shap_feature_data = {
+    "ARX(1)": [],
+    "Joint Model": [],
+    "Super Learner": []
+}
+
+os.makedirs(
+    "results/AR_superlearner/SHAP",
+    exist_ok=True
+)
+
+
+# --------------------------------------------------
+# COMBINE SHAP VALUES ACROSS ALL FIVE FOLDS
+# --------------------------------------------------
+
+combined_explanations = {}
+
+for model_name in shap_explanations:
+
+    fold_explanations = shap_explanations[model_name]
+
+    combined_values = np.vstack([
+        exp.values for exp in fold_explanations
+    ])
+
+    combined_base_values = np.concatenate([
+        np.asarray(exp.base_values).reshape(-1)
+        for exp in fold_explanations
+    ])
+
+    combined_data = pd.concat(
+        shap_feature_data[model_name]
+    )
+
+    combined_explanations[model_name] = shap.Explanation(
+        values=combined_values,
+        base_values=combined_base_values,
+        data=combined_data.values,
+        feature_names=combined_data.columns.tolist()
+    )
+
+
+# --------------------------------------------------
+# TOP 10 FEATURES FOR EACH MODEL
+# --------------------------------------------------
+
+for model_name, explanation in combined_explanations.items():
+
+    mean_abs_shap = np.abs(
+        explanation.values
+    ).mean(axis=0)
+
+    importance = pd.Series(
+        mean_abs_shap,
+        index=explanation.feature_names
+    ).sort_values(ascending=False)
+
+    top_features = importance.head(10).index.tolist()
+
+    print(f"\nTOP SHAP FEATURES: {model_name}")
+    print(importance.head(10).round(4))
+
+
+    # --------------------------------------------------
+    # 1. BEESWARM PLOT
+    # --------------------------------------------------
+
+    top_indices = [
+        explanation.feature_names.index(feature)
+        for feature in top_features
+    ]
+
+    top_explanation = explanation[:, top_indices]
+
+    plt.figure(figsize=(10, 6))
+
+    shap.plots.beeswarm(
+        top_explanation,
+        max_display=10,
+        show=False
+    )
+
+    plt.title(f"SHAP Beeswarm: {model_name}")
+    plt.tight_layout()
+
+    filename = model_name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+
+    plt.savefig(
+        f"results/AR_superlearner/SHAP/{filename}_beeswarm.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+
+    # --------------------------------------------------
+    # 2. DEPENDENCE PLOTS
+    # --------------------------------------------------
+
+    # Plot the three most important features
+    for feature in top_features[:3]:
+
+        plt.figure(figsize=(8, 5))
+
+        shap.plots.scatter(
+            explanation[:, feature],
+            show=False
+        )
+
+        plt.title(
+            f"SHAP Dependence: {feature} — {model_name}"
+        )
+
+        plt.tight_layout()
+
+        plt.savefig(
+            f"results/AR_superlearner/SHAP/{filename}_dependence_{feature}.png",
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+        plt.show()
+
+
+    # --------------------------------------------------
+    # 3. FORCE PLOT
+    # --------------------------------------------------
+
+    # Explain the latest out-of-sample observation
+    latest_index = len(explanation.values) - 1
+
+    plt.figure(figsize=(14, 4))
+
+    shap.force_plot(
+        explanation.base_values[latest_index],
+        explanation.values[latest_index],
+        explanation.data[latest_index],
+        feature_names=explanation.feature_names,
+        matplotlib=True,
+        show=False
+    )
+
+    plt.title(
+        f"SHAP Force Plot: Latest Test Observation — {model_name}"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        f"results/AR_superlearner/SHAP/{filename}_force.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+
+print("\nAll SHAP visualizations saved successfully.")

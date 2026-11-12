@@ -1,0 +1,6 @@
+Item,Value
+Input file,/Users/ngaikristen/ECON-422-Github--2/Code/data/processed/forecast_features.csv
+Target,target_next_month (fare_inflation_yoy shifted by -1)
+ARX features,"fare_lag_1, fuel_lag_1"
+Joint features,"fare_lag_1, fare_lag_2, fare_lag_3, fare_lag_6, fare_lag_12, fuel_lag_1, fuel_lag_3, fuel_lag_6"
+Observations,290

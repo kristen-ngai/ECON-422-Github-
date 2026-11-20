@@ -1,0 +1,132 @@
+
+from arch import arch_model
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+for ax, model_name in zip(axes, plot_models):
+
+    model_data = predictions_df[
+        predictions_df["Model"] == model_name
+    ].sort_values("Date")
+
+
+
+# Get selected model's out-of-sample residuals
+selected_predictions = predictions_df[
+    predictions_df["Model"] == selected_model
+].copy()
+
+selected_predictions = (
+    selected_predictions.sort_values("Date")
+)
+
+# Extract residuals and remove missing/infinite values
+residuals = selected_predictions["Error"].replace(
+    [np.inf, -np.inf], np.nan
+).dropna()
+
+# GARCH works better with a sufficiently long residual series
+if len(residuals) >= 50:
+
+    # Rescale residuals to improve numerical stability
+    # Original residuals have a relatively large numerical scale
+    scaling_factor = 1000
+
+    scaled_residuals = residuals / scaling_factor
+
+    # Estimate GARCH(1,1) with Student's t innovations
+    garch_model = arch_model(
+        scaled_residuals,
+        mean="Zero",
+        vol="GARCH",
+        p=1,
+        q=1,
+        dist="t",
+        rescale=False
+    )
+
+    garch_results = garch_model.fit(
+        disp="off",
+        cov_type="robust"
+    )
+
+    print("\nGARCH(1,1) RESULTS")
+    print(garch_results.summary())
+
+    # Save coefficient estimates
+    garch_parameters = pd.DataFrame({
+        "Parameter": garch_results.params.index,
+        "Estimate": garch_results.params.values,
+        "P_Value": garch_results.pvalues.values
+    })
+
+    garch_parameters.to_csv(
+        f"{output_dir}/GARCH_coefficients.csv",
+        index=False
+    )
+
+    # Extract conditional volatility
+    # Convert estimates back to original residual units
+    conditional_volatility = (
+        garch_results.conditional_volatility * scaling_factor
+    )
+
+    garch_volatility_df = pd.DataFrame({
+        "Date": selected_predictions.loc[
+            residuals.index, "Date"
+        ].to_numpy(),
+        "Conditional_Volatility": np.asarray(
+            conditional_volatility
+        )
+    })
+
+    garch_volatility_df.to_csv(
+        f"{output_dir}/GARCH_conditional_volatility.csv",
+        index=False
+    )
+
+    # Plot conditional volatility
+    plt.figure(figsize=(12, 5))
+
+    plt.plot(
+        garch_volatility_df["Date"],
+        garch_volatility_df["Conditional_Volatility"],
+        color="steelblue",
+        linewidth=1.5
+    )
+
+    plt.title(
+        f"GARCH(1,1) Conditional Forecast-Error Volatility: "
+        f"{selected_model}"
+    )
+
+    plt.xlabel("Date")
+    plt.ylabel("Conditional Volatility")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(
+        f"{output_dir}/GARCH_volatility.png",
+        dpi=300
+    )
+
+    plt.show()
+
+    # Report scaling information
+    print("\nGARCH SCALING INFORMATION")
+    print(f"Original residual standard deviation: {residuals.std():.4f}")
+    print(f"Scaling factor: {scaling_factor}")
+    print(
+        f"Scaled residual standard deviation: "
+        f"{scaled_residuals.std():.4f}"
+    )
+
+    print("\nGARCH conditional volatility saved successfully.")
+
+else:
+    print(
+        "Not enough out-of-sample residual observations "
+        "for a reliable GARCH analysis."
+    )
+
